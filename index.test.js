@@ -1,5 +1,6 @@
 import test, { describe, it, after, beforeEach } from "node:test"
 import assert from "node:assert/strict"
+import { setImmediate } from "node:timers"
 import { setTimeout as delay } from "node:timers/promises"
 import { PassThrough } from "node:stream"
 
@@ -13,6 +14,7 @@ import {
   buildSystemPrompt,
   buildPrompt,
   extractAssistantText,
+  unwrapAssistantMessage,
   mapFinishReason,
   resolveModel,
   normalizeAnthropicMessages,
@@ -486,6 +488,49 @@ test("stream: true returns SSE response", async () => {
   assert.ok(text.includes("[DONE]"))
 })
 
+test("stream: true excludes reasoning-part deltas", async () => {
+  const events = [
+    { type: "message.part.updated", properties: { part: { id: "reason-1", sessionID: "sess-123", type: "reasoning", text: "" } } },
+    { type: "message.part.delta", properties: { sessionID: "sess-123", partID: "reason-1", field: "text", delta: "Internal reasoning" } },
+    { type: "message.part.updated", properties: { part: { id: "text-1", sessionID: "sess-123", type: "text", text: "" } } },
+    { type: "message.part.delta", properties: { sessionID: "sess-123", partID: "text-1", field: "text", delta: "Visible answer" } },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+  const handler = createProxyFetchHandler(createStreamingClient(events))
+  const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ model: "gpt-4o", stream: true, messages: [{ role: "user", content: "hi" }] }),
+  }))
+  const text = await response.text()
+
+  assert.match(text, /Visible answer/)
+  assert.doesNotMatch(text, /Internal reasoning/)
+})
+
+test("stream: true unwraps an assistant envelope for conversation continuations", async () => {
+  const events = [
+    { type: "message.part.delta", properties: { sessionID: "sess-123", field: "text", delta: "I need to continue.\n" } },
+    { type: "message.part.delta", properties: { sessionID: "sess-123", field: "text", delta: '{"role":"assistant","content":[{"type":"text","text":"Clean answer"}]}' } },
+    { type: "session.idle", properties: { sessionID: "sess-123" } },
+  ]
+  const handler = createProxyFetchHandler(createStreamingClient(events))
+  const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      stream: true,
+      messages: [{ role: "user", content: "Question" }, { role: "assistant", content: "Earlier answer" }, { role: "user", content: "Continue" }],
+    }),
+  }))
+  const text = await response.text()
+
+  assert.equal(response.status, 200)
+  assert.match(text, /Clean answer/)
+  assert.doesNotMatch(text, /I need to continue|\\"role\\":\\"assistant/)
+})
+
 test("stream: true with unknown model returns a safe 400", async () => {
   const handler = createProxyFetchHandler(createClient()) // no providers
   const request = new Request("http://127.0.0.1:4010/v1/chat/completions", {
@@ -741,7 +786,8 @@ describe("buildSystemPrompt", () => {
   it("always includes the proxy hint lines", () => {
     const result = buildSystemPrompt([], {})
     assert.ok(result.includes("proxy backed by OpenCode"))
-    assert.ok(result.includes("Return only the assistant"))
+    assert.ok(result.includes("Do not describe your reasoning"))
+    assert.ok(result.includes("Do not emit JSON or a message envelope"))
   })
 
   it("does not turn generation controls into prompt hints", () => {
@@ -995,6 +1041,15 @@ describe("createSseQueue", () => {
     queue.finish()
     const results = await generatorPromise
     assert.deepEqual(results, ["late"])
+  })
+
+  it("emits SSE keepalives while waiting for buffered output", async () => {
+    const queue = createSseQueue()
+    const generator = queue.generateChunks(1)
+
+    assert.deepEqual(await generator.next(), { value: ": keep-alive\n\n", done: false })
+    queue.finish()
+    assert.deepEqual(await generator.next(), { value: undefined, done: true })
   })
 })
 
@@ -2361,8 +2416,12 @@ test("normalizeResponseInput renders prior function_call and function_call_outpu
 // Integration: end-to-end tool calling via the dynamic MCP bridge
 // ---------------------------------------------------------------------------
 
-function createToolCallClient({ toolName, toolArgs, callID = "call_1", finish = "tool_calls", providers } = {}) {
+function createToolCallClient({ toolName, toolArgs, callID = "call_1", finish = "tool_calls", providers, syncEvents = false, deferPrompt = false } = {}) {
   let capturedSlotName = null
+  let promptFinished = false
+  const updated = (part) => syncEvents
+    ? { type: "sync", syncEvent: { type: "message.part.updated.1", data: { sessionID: "sess-tool-1", part } } }
+    : { type: "message.part.updated", properties: { part } }
 
   return {
     app: { log: async () => {} },
@@ -2387,7 +2446,12 @@ function createToolCallClient({ toolName, toolArgs, callID = "call_1", finish = 
     },
     session: {
       create: async () => ({ data: { id: "sess-tool-1" } }),
-      promptAsync: async () => {},
+      promptAsync: deferPrompt
+        ? () => new Promise((resolve) => setImmediate(() => {
+          promptFinished = true
+          resolve()
+        }))
+        : async () => {},
       abort: async () => ({ data: true }),
       messages: async () => ({
         data: [
@@ -2405,25 +2469,13 @@ function createToolCallClient({ toolName, toolArgs, callID = "call_1", finish = 
     event: {
       subscribe: async () => ({
         stream: (async function* () {
+          if (deferPrompt) assert.equal(promptFinished, false, "events must be consumed before promptAsync settles")
           const tool = `${capturedSlotName}_${toolName}`
           // Real OpenCode lifecycle: input is empty on "pending" and only populated on
           // "running"; the tool-calling step ends with a step-finish for the same message.
-          yield {
-            type: "message.part.updated",
-            properties: {
-              part: { sessionID: "sess-tool-1", messageID: "msg-1", type: "tool", tool, callID, state: { status: "pending", input: {} } },
-            },
-          }
-          yield {
-            type: "message.part.updated",
-            properties: {
-              part: { sessionID: "sess-tool-1", messageID: "msg-1", type: "tool", tool, callID, state: { status: "running", input: toolArgs } },
-            },
-          }
-          yield {
-            type: "message.part.updated",
-            properties: { part: { sessionID: "sess-tool-1", messageID: "msg-1", type: "step-finish" } },
-          }
+          yield updated({ sessionID: "sess-tool-1", messageID: "msg-1", type: "tool", tool, callID, state: { status: "pending", input: {} } })
+          yield updated({ sessionID: "sess-tool-1", messageID: "msg-1", type: "tool", tool, callID, state: { status: "running", input: toolArgs } })
+          yield updated({ sessionID: "sess-tool-1", messageID: "msg-1", type: "step-finish" })
         })(),
       }),
     },
@@ -2461,6 +2513,44 @@ test("POST /v1/chat/completions returns tool_calls when the model calls a caller
   assert.equal(body.choices[0].message.tool_calls[0].function.name, "get_weather")
   assert.deepEqual(JSON.parse(body.choices[0].message.tool_calls[0].function.arguments), { city: "NYC" })
   assert.equal(body.choices[0].message.tool_calls[0].id, "call_1")
+})
+
+describe("unwrapAssistantMessage", () => {
+  it("extracts an exact assistant text envelope after reasoning", () => {
+    const value = 'I need to continue the conversation.\n{"role":"assistant","content":[{"type":"text","text":"Order counts by status."}]},'
+    assert.equal(unwrapAssistantMessage(value), "Order counts by status.")
+  })
+
+  it("leaves ordinary JSON and mixed assistant content unchanged", () => {
+    const json = '{"status":"ok"}'
+    const mixed = '{"role":"assistant","content":[{"type":"image","url":"example"}]}'
+    assert.equal(unwrapAssistantMessage(json), json)
+    assert.equal(unwrapAssistantMessage(mixed), mixed)
+  })
+})
+
+test("POST /v1/chat/completions handles current sync events before promptAsync settles", async () => {
+  const client = createToolCallClient({
+    toolName: "get_weather",
+    toolArgs: { city: "NYC" },
+    syncEvents: true,
+    deferPrompt: true,
+  })
+  const handler = createProxyFetchHandler(client)
+  const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "What's the weather in NYC?" }],
+      tools: [{ type: "function", function: { name: "get_weather" } }],
+    }),
+  }))
+  const body = await response.json()
+
+  assert.equal(response.status, 200)
+  assert.equal(body.choices[0].finish_reason, "tool_calls")
+  assert.deepEqual(JSON.parse(body.choices[0].message.tool_calls[0].function.arguments), { city: "NYC" })
 })
 
 test("POST /v1/chat/completions stream: true emits tool_calls delta and finish_reason", async () => {
@@ -3485,6 +3575,48 @@ describe("OpenAIProxyPlugin", () => {
           delete process.env.OPENCODE_LLM_PROXY_HOST
           delete process.env.OPENCODE_LLM_PROXY_PORT
         }
+      },
+    )
+  })
+
+  it("uses native plugin events for caller-supplied tool calls", async () => {
+    let fetch
+    let hooks
+    const client = createToolCallClient({ toolName: "get_weather", toolArgs: { city: "NYC" } })
+    client.event.subscribe = async () => {
+      throw new Error("SDK event subscription must not be used")
+    }
+    client.session.promptAsync = ({ body }) => new Promise((resolve) => setImmediate(() => {
+      const tool = Object.keys(body.tools).find((name) => body.tools[name])
+      assert.equal(body.tools["*"], false)
+      assert.equal(body.tools[tool], true)
+      const emit = (part) => hooks.event({ event: { type: "message.part.updated", properties: { part } } })
+      emit({ sessionID: "sess-tool-1", messageID: "msg-1", type: "tool", tool, callID: "call_1", state: { status: "running", input: { city: "NYC" } } })
+      emit({ sessionID: "sess-tool-1", messageID: "msg-1", type: "step-finish" })
+      resolve()
+    }))
+
+    await withMockedBun(
+      (options) => {
+        fetch = options.fetch
+        return {}
+      },
+      async () => {
+        hooks = await OpenAIProxyPlugin({ client })
+        const response = await fetch(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            model: "gpt-4o",
+            messages: [{ role: "user", content: "What's the weather in NYC?" }],
+            tools: [{ type: "function", function: { name: "get_weather" } }],
+          }),
+        }))
+        const body = await response.json()
+
+        assert.equal(response.status, 200)
+        assert.equal(body.choices[0].message.tool_calls[0].function.name, "get_weather")
+        assert.deepEqual(JSON.parse(body.choices[0].message.tool_calls[0].function.arguments), { city: "NYC" })
       },
     )
   })

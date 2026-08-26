@@ -1036,6 +1036,53 @@ function getState() {
   }
   return globalThis[STATE_KEY];
 }
+function createPluginEventStream(listeners, sessionID, signal) {
+  if (!listeners) return null;
+  const queued = [];
+  let waiting = null;
+  let closed = false;
+  const listener = (event) => {
+    const properties = event.syncEvent?.data ?? event.properties;
+    if (properties?.sessionID !== sessionID && properties?.part?.sessionID !== sessionID) return;
+    if (waiting) {
+      const resolve = waiting;
+      waiting = null;
+      resolve({ value: event, done: false });
+      return;
+    }
+    queued.push(event);
+  };
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    listeners.delete(listener);
+    signal?.removeEventListener("abort", close);
+    if (waiting) {
+      waiting({ value: void 0, done: true });
+      waiting = null;
+    }
+  };
+  listeners.add(listener);
+  signal?.addEventListener("abort", close, { once: true });
+  return {
+    stream: {
+      next: async () => {
+        if (queued.length > 0) return { value: queued.shift(), done: false };
+        if (closed) return { value: void 0, done: true };
+        return new Promise((resolve) => {
+          waiting = resolve;
+        });
+      },
+      return: async () => {
+        close();
+        return { value: void 0, done: true };
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      }
+    }
+  };
+}
 var DEFAULTS = Object.freeze({
   requestTimeoutMs: 12e4,
   maxRequestBytes: 1024 * 1024,
@@ -1350,11 +1397,12 @@ function renderedSystem(canonicalSystem) {
   return [
     canonicalSystem,
     "You are answering through a proxy backed by OpenCode.",
-    "Return only the assistant's reply content."
+    "Respond directly to the user. Do not describe your reasoning, the conversation, roles, or tool calls. Do not emit JSON or a message envelope. Output only the natural-language answer text."
   ].filter(Boolean).join("\n\n");
 }
 async function prepareCanonicalRequest(canonical2, config, signal, candidates = []) {
   const rendered = renderOpenCodePrompt(canonical2);
+  const unwrapAssistantEnvelope = canonical2.messages.length > 1;
   for (const part of rendered.media) {
     const kind = part.mime === "application/pdf" ? "pdf" : part.mime.split("/", 1)[0];
     if (candidates.length > 0 && candidates.every((model) => model.capabilities?.input?.[kind] === false)) {
@@ -1391,7 +1439,7 @@ async function prepareCanonicalRequest(canonical2, config, signal, candidates = 
         }
       }
     });
-    return { messages: [{ role: "user", content: rendered.text }], system: renderedSystem(rendered.system), media };
+    return { messages: [{ role: "user", content: rendered.text }], system: renderedSystem(rendered.system), media, unwrapAssistantEnvelope };
   } catch (error) {
     const outcome = error?.code === "media_timeout" ? "timeout" : error?.code === "media_aborted" ? "cancelled" : error?.status === 400 || error?.status === 413 || error?.status === 415 ? "rejected" : "error";
     finish(outcome);
@@ -1479,7 +1527,7 @@ function buildSystemPrompt(messages, _request) {
   const systemMessages = messages.filter((message) => message.role === "system" || message.role === "developer").map((message) => message.content);
   const hints = [
     "You are answering through a proxy backed by OpenCode.",
-    "Return only the assistant's reply content."
+    "Respond directly to the user. Do not describe your reasoning, the conversation, roles, or tool calls. Do not emit JSON or a message envelope. Output only the natural-language answer text."
   ];
   return [...systemMessages, ...hints].join("\n\n").trim();
 }
@@ -1504,6 +1552,22 @@ ${message.content}`).join("\n\n");
 }
 function extractAssistantText(parts) {
   return parts.filter((part) => part.type === "text" && typeof part.text === "string").map((part) => part.text).join("").trim();
+}
+function unwrapAssistantMessage(value) {
+  if (typeof value !== "string") return value;
+  const trimmed = value.trim();
+  const start = trimmed.lastIndexOf('{"role":"assistant","content":');
+  if (start === -1) return value;
+  const candidate = trimmed.slice(start).replace(/,$/, "");
+  let message;
+  try {
+    message = JSON.parse(candidate);
+  } catch {
+    return value;
+  }
+  if (message?.role !== "assistant" || !Array.isArray(message.content)) return value;
+  const blocks = message.content.map((part) => part?.type === "text" && typeof part.text === "string" ? part.text : null);
+  return blocks.every((text2) => text2 !== null) ? blocks.join("").trim() : value;
 }
 function dataUrlSize(url) {
   if (typeof url !== "string" || !url.startsWith("data:")) return 0;
@@ -1582,7 +1646,7 @@ async function executePrompt(client, _request, model, messages, system, callerTo
       }
     };
   }
-  const tools = await getDisabledTools(client);
+  const tools = { "*": false };
   let sessionID;
   try {
     const session = await client.session.create({ body: { title: `Proxy: ${model.id}` }, signal: options.signal });
@@ -1601,7 +1665,8 @@ async function executePrompt(client, _request, model, messages, system, callerTo
       }
     });
     const structured = completion.data.info?.structured;
-    const content = structured === void 0 ? extractAssistantText(completion.data.parts ?? []) : JSON.stringify(structured);
+    let content = structured === void 0 ? extractAssistantText(completion.data.parts ?? []) : JSON.stringify(structured);
+    if (structured === void 0 && options.unwrapAssistantEnvelope) content = unwrapAssistantMessage(content);
     if (!content && completion.data.info?.error) throw new Error(completion.data.info.error.message ?? "Model call failed.");
     return { content, structured, toolCalls: [], completion, request: _request, sessionID };
   } finally {
@@ -1610,7 +1675,9 @@ async function executePrompt(client, _request, model, messages, system, callerTo
   }
 }
 async function executePromptStreaming(client, model, messages, system, onChunk, callerTools = [], options = {}) {
-  const result = await runAgentTurn(client, model, messages, system, callerTools, onChunk, options);
+  const result = await runAgentTurn(client, model, messages, system, callerTools, options.unwrapAssistantEnvelope ? () => {
+  } : onChunk, options);
+  if (options.unwrapAssistantEnvelope && result.toolCalls.length === 0 && result.content) await onChunk(unwrapAssistantMessage(result.content));
   return {
     sessionID: result.sessionID,
     tokens: result.tokens,
@@ -1734,14 +1801,6 @@ async function safeLog(client, level, message, extra) {
     });
   } catch {
   }
-}
-async function getDisabledTools(client) {
-  const state = getState();
-  if (state.toolOffSwitch) return state.toolOffSwitch;
-  const result = await client.tool.ids();
-  const ids = Array.isArray(result.data) ? result.data : [];
-  state.toolOffSwitch = Object.fromEntries(ids.map((id) => [id, false]));
-  return state.toolOffSwitch;
 }
 function getToolBridgeState() {
   const state = getState();
@@ -1975,7 +2034,7 @@ function buildToolsMap(baseTools, bridge) {
   return toolsMap;
 }
 async function runAgentTurn(client, model, messages, system, callerTools, onChunk, options = {}) {
-  const baseTools = await getDisabledTools(client);
+  const baseTools = { "*": false };
   let toolsMap = baseTools;
   let bridge = null;
   if (Array.isArray(callerTools) && callerTools.length > 0) {
@@ -1995,6 +2054,7 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   let content = "";
   const toolCallsByID = /* @__PURE__ */ new Map();
   let toolMessageID = null;
+  const reasoningPartIDs = /* @__PURE__ */ new Set();
   const recordToolPart = (part) => {
     const callID = part.callID;
     if (!callID) return;
@@ -2021,9 +2081,14 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     });
     removeAbortListener = () => options.signal?.removeEventListener("abort", onAbort);
     options.signal?.addEventListener("abort", onAbort, { once: true });
-    const { stream } = await client.event.subscribe({ signal: options.signal });
-    eventStream = stream;
-    await client.session.promptAsync({
+    const pluginEvents = options.eventStreamFactory?.(sessionID, options.signal);
+    if (pluginEvents) {
+      eventStream = pluginEvents.stream;
+    } else {
+      const { stream } = await client.event.subscribe({ signal: options.signal });
+      eventStream = stream;
+    }
+    const prompt = client.session.promptAsync({
       path: { id: sessionID },
       signal: options.signal,
       body: {
@@ -2035,16 +2100,21 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         ...options.variant ? { variant: options.variant } : {}
       }
     });
-    for await (const event of stream) {
-      if (event.type === "message.part.delta") {
-        const props = event.properties;
-        if (props?.sessionID === sessionID && props?.field === "text" && typeof props.delta === "string" && props.delta.length > 0) {
+    prompt.catch(() => {
+    });
+    for await (const event of eventStream) {
+      const eventType = (event.syncEvent?.type ?? event.type)?.replace(/\.\d+$/, "");
+      const properties = event.syncEvent?.data ?? event.properties;
+      if (eventType === "message.part.delta") {
+        const props = properties;
+        if (props?.sessionID === sessionID && props?.field === "text" && !reasoningPartIDs.has(props.partID) && typeof props.delta === "string" && props.delta.length > 0) {
           content += props.delta;
           await onChunk?.(props.delta);
         }
-      } else if (event.type === "message.part.updated") {
-        const part = event.properties?.part;
+      } else if (eventType === "message.part.updated") {
+        const part = properties?.part;
         if (!part || part.sessionID !== sessionID) continue;
+        if (part.type === "reasoning" && part.id) reasoningPartIDs.add(part.id);
         if (toolIDSet && part.type === "tool" && toolIDSet.has(part.tool) && (!toolMessageID || part.messageID === toolMessageID)) {
           if (part.messageID) toolMessageID = part.messageID;
           recordToolPart(part);
@@ -2055,17 +2125,20 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
           }
           break;
         }
-      } else if (event.type === "session.error") {
-        if (event.properties?.sessionID === sessionID) {
-          errorMessage = event.properties?.error?.message ?? "Model call failed.";
+      } else if (eventType === "session.error") {
+        if (properties?.sessionID === sessionID) {
+          errorMessage = properties?.error?.message ?? "Model call failed.";
         }
         break;
-      } else if (event.type === "session.idle") {
-        if (event.properties?.sessionID === sessionID) {
+      } else if (eventType === "session.idle") {
+        if (properties?.sessionID === sessionID) {
           break;
         }
       }
     }
+    if (toolCallsByID.size === 0) await prompt;
+    else prompt.catch(() => {
+    });
   } catch (error) {
     await deleteSession(client, sessionID, options.keepSessions);
     throw error;
@@ -2100,6 +2173,9 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     content = extractAssistantText(assistantEntry?.parts ?? []);
   }
   if (!content && assistantInfo?.structured !== void 0) content = JSON.stringify(assistantInfo.structured);
+  if (toolCalls.length === 0 && assistantInfo?.structured === void 0 && options.unwrapAssistantEnvelope) {
+    content = unwrapAssistantMessage(content);
+  }
   const result = {
     sessionID,
     content,
@@ -2240,15 +2316,25 @@ function createSseQueue() {
       r();
     }
   }
-  async function* generateChunks() {
+  async function* generateChunks(heartbeatMs = 5e3) {
     while (true) {
       while (chunks.length > 0) {
         yield chunks.shift();
       }
       if (done) break;
-      await new Promise((r) => {
-        resolve = r;
+      const status = await new Promise((r) => {
+        let timer;
+        const wake = () => {
+          clearTimeout(timer);
+          r("ready");
+        };
+        resolve = wake;
+        timer = setTimeout(() => {
+          if (resolve === wake) resolve = null;
+          r("heartbeat");
+        }, heartbeatMs);
       });
+      if (status === "heartbeat" && !done && chunks.length === 0) yield ": keep-alive\n\n";
     }
     while (chunks.length > 0) {
       yield chunks.shift();
@@ -2477,7 +2563,7 @@ function geminiModelFromPath(pathname) {
   const match = pathname.match(/^\/v1beta\/models\/(.+):(?:generateContent|streamGenerateContent)$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
-function createProxyFetchHandler(client) {
+function createProxyFetchHandler(client, eventStreamFactory) {
   const config = loadConfig();
   const handleRequest = async (request) => {
     const url = new URL(request.url);
@@ -2517,7 +2603,8 @@ function createProxyFetchHandler(client) {
       maxRequestBytes: config.maxRequestBytes,
       bridgeAcquireTimeoutMs: config.bridgeAcquireTimeoutMs,
       bridgeMaxQueue: config.bridgeMaxQueue,
-      keepSessions: config.keepSessions
+      keepSessions: config.keepSessions,
+      eventStreamFactory
     };
     const streamCleanup = once(() => {
       releaseSlot();
@@ -2594,11 +2681,11 @@ function createProxyFetchHandler(client) {
         } catch (error) {
           return badRequest(error.message, error.status ?? 400, request, error.code);
         }
-        const { messages, system, media } = prepared;
+        const { messages, system, media, unwrapAssistantEnvelope } = prepared;
         if (!messages[0].content.trim() && media.length === 0) {
           return badRequest("No text content was found in the supplied messages.", 400, request);
         }
-        const requestOptions = { ...options, media, format, controls, variant: request.headers.get("x-opencode-variant") ?? void 0 };
+        const requestOptions = { ...options, media, format, controls, unwrapAssistantEnvelope: unwrapAssistantEnvelope && !format, variant: request.headers.get("x-opencode-variant") ?? void 0 };
         let model = candidates[0];
         if (body.stream) {
           const completionID = `chatcmpl_${crypto.randomUUID().replace(/-/g, "")}`;
@@ -2766,11 +2853,11 @@ data: [DONE]
         } catch (error) {
           return badRequest(error.message, error.status ?? 400, request, error.code);
         }
-        const { messages, system, media } = prepared;
+        const { messages, system, media, unwrapAssistantEnvelope } = prepared;
         if (!messages[0].content.trim() && media.length === 0) {
           return badRequest("The 'input' field must contain at least one text message.", 400, request);
         }
-        const requestOptions = { ...options, media, format, controls, variant: request.headers.get("x-opencode-variant") ?? body.reasoning?.effort ?? void 0 };
+        const requestOptions = { ...options, media, format, controls, unwrapAssistantEnvelope: unwrapAssistantEnvelope && !format, variant: request.headers.get("x-opencode-variant") ?? body.reasoning?.effort ?? void 0 };
         let model = candidates[0];
         if (body.stream) {
           let sseEvent = function(eventType, data) {
@@ -3042,11 +3129,11 @@ data: ${JSON.stringify(data)}
         } catch (error) {
           return anthropicBadRequest(error.message, error.status ?? 400, request);
         }
-        const { messages, system, media } = prepared;
+        const { messages, system, media, unwrapAssistantEnvelope } = prepared;
         if (!messages[0].content.trim() && media.length === 0) {
           return anthropicBadRequest("No text content was found in the supplied messages.", 400, request);
         }
-        const requestOptions = { ...options, media, controls, variant: request.headers.get("x-opencode-variant") ?? void 0 };
+        const requestOptions = { ...options, media, controls, unwrapAssistantEnvelope, variant: request.headers.get("x-opencode-variant") ?? void 0 };
         let model = candidates[0];
         if (body.stream) {
           let sseEvent = function(eventType, data) {
@@ -3216,11 +3303,11 @@ data: ${JSON.stringify(data)}
         } catch (error) {
           return badRequest(error.message, error.status ?? 400, request, error.code);
         }
-        const { messages, system, media } = prepared;
+        const { messages, system, media, unwrapAssistantEnvelope } = prepared;
         if (!messages[0].content.trim() && media.length === 0) {
           return badRequest("No text content was found in the supplied contents.", 400, request);
         }
-        const requestOptions = { ...options, media, format, controls, variant: request.headers.get("x-opencode-variant") ?? void 0 };
+        const requestOptions = { ...options, media, format, controls, unwrapAssistantEnvelope: unwrapAssistantEnvelope && !format, variant: request.headers.get("x-opencode-variant") ?? void 0 };
         if (isGeminiStream) {
           const queue = createSseQueue();
           let emitted = false;
@@ -3359,10 +3446,11 @@ var OpenAIProxyPlugin = async ({ client }) => {
   }
   let server;
   try {
+    state.pluginEvents = /* @__PURE__ */ new Set();
     server = Bun.serve({
       hostname,
       port,
-      fetch: createProxyFetchHandler(client)
+      fetch: createProxyFetchHandler(client, (sessionID, signal) => createPluginEventStream(state.pluginEvents, sessionID, signal))
     });
   } catch (error) {
     await safeLog(client, "warn", "OpenAI proxy server failed to start", {
@@ -3380,6 +3468,9 @@ var OpenAIProxyPlugin = async ({ client }) => {
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN)
   });
   return {
+    event: ({ event }) => {
+      for (const listener of state.pluginEvents) listener(event);
+    },
     "chat.params": async (input, output) => {
       const controls = getState().generationControls?.get(input.sessionID);
       if (!controls) return;
@@ -3418,5 +3509,6 @@ export {
   releaseToolBridge,
   resolveModel,
   sanitizeToolName,
-  toTextContent
+  toTextContent,
+  unwrapAssistantMessage
 };
