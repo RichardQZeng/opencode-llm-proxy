@@ -2259,10 +2259,19 @@ export function createProxyFetchHandler(client, eventStreamFactory) {
               const toolCalls = streamResult.toolCalls ?? []
               if (toolCalls.length > 0) {
                 // Each parallel tool call is its own output item with a distinct output_index.
+                const completedOutput = []
                 toolCalls.forEach((call, index) => {
                   const args = JSON.stringify(call.arguments ?? {})
                   const callItemID = `fc_${crypto.randomUUID().replace(/-/g, "")}`
                   const outputIndex = index
+                  completedOutput.push({
+                    id: callItemID,
+                    type: "function_call",
+                    status: "completed",
+                    call_id: call.id,
+                    name: call.name,
+                    arguments: args,
+                  })
                   queue.enqueue(
                     sseEvent("response.output_item.added", {
                       type: "response.output_item.added",
@@ -2317,6 +2326,12 @@ export function createProxyFetchHandler(client, eventStreamFactory) {
                       created_at: now,
                       status: "completed",
                       model: model.id,
+                      // The OpenAI Responses API always includes the final `output` array on
+                      // response.completed (mirroring the one sent empty on response.created).
+                      // Clients (e.g. langchainjs-openai) read `response.output` here to build
+                      // the final aggregated message/tool-call - omitting it causes them to
+                      // crash doing `response.output.map(...)` on undefined.
+                      output: completedOutput,
                       usage: {
                         input_tokens: streamResult.tokens.input,
                         output_tokens: streamResult.tokens.output,
@@ -2354,7 +2369,13 @@ export function createProxyFetchHandler(client, eventStreamFactory) {
                 sseEvent("response.output_item.done", {
                   type: "response.output_item.done",
                   output_index: 0,
-                  item: { id: itemID, type: "message", status: "completed", role: "assistant" },
+                  item: {
+                    id: itemID,
+                    type: "message",
+                    status: "completed",
+                    role: "assistant",
+                    content: [{ type: "output_text", text: accumulatedText, annotations: [] }],
+                  },
                 }),
               )
               queue.enqueue(
@@ -2366,6 +2387,16 @@ export function createProxyFetchHandler(client, eventStreamFactory) {
                     created_at: now,
                     status: "completed",
                     model: model.id,
+                    // See the tool-call branch above for why `output` must be present here.
+                    output: [
+                      {
+                        id: itemID,
+                        type: "message",
+                        status: "completed",
+                        role: "assistant",
+                        content: [{ type: "output_text", text: accumulatedText, annotations: [] }],
+                      },
+                    ],
                     usage: {
                       input_tokens: streamResult.tokens.input,
                       output_tokens: streamResult.tokens.output,
@@ -2820,6 +2851,17 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     })
     return {}
   }
+  // Bun's default idleTimeout is 10s, which is far too short for LLM completions -
+  // even simple ones routinely take longer, and long or tool-calling turns can take
+  // well over a minute. Without raising this, Bun aborts the in-flight request mid-
+  // stream ("[Bun.serve]: request timed out after 10 seconds"), silently truncating
+  // the SSE response before response.completed / [DONE] is ever sent. Callers can
+  // still override it (e.g. to something shorter) via OPENCODE_LLM_PROXY_IDLE_TIMEOUT.
+  // 255 is Bun's current maximum for this option (it's stored as a uint8 internally).
+  const idleTimeout = Math.min(
+    255,
+    Math.max(10, Number.parseInt(process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT ?? "255", 10) || 255),
+  )
 
   let server
   try {
@@ -2827,6 +2869,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
     server = Bun.serve({
       hostname,
       port,
+      idleTimeout,
       fetch: createProxyFetchHandler(client, (sessionID, signal) => createPluginEventStream(state.pluginEvents, sessionID, signal)),
     })
   } catch (error) {
@@ -2845,6 +2888,7 @@ export const OpenAIProxyPlugin = async ({ client }) => {
   await safeLog(client, "info", "OpenAI proxy server started", {
     hostname,
     port,
+    idleTimeout,
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN),
   })
 

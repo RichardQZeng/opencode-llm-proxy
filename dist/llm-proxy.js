@@ -2938,10 +2938,19 @@ data: ${JSON.stringify(data)}
               }
               const toolCalls = streamResult.toolCalls ?? [];
               if (toolCalls.length > 0) {
+                const completedOutput = [];
                 toolCalls.forEach((call, index) => {
                   const args = JSON.stringify(call.arguments ?? {});
                   const callItemID = `fc_${crypto.randomUUID().replace(/-/g, "")}`;
                   const outputIndex = index;
+                  completedOutput.push({
+                    id: callItemID,
+                    type: "function_call",
+                    status: "completed",
+                    call_id: call.id,
+                    name: call.name,
+                    arguments: args
+                  });
                   queue.enqueue(
                     sseEvent("response.output_item.added", {
                       type: "response.output_item.added",
@@ -2996,6 +3005,12 @@ data: ${JSON.stringify(data)}
                       created_at: now,
                       status: "completed",
                       model: model.id,
+                      // The OpenAI Responses API always includes the final `output` array on
+                      // response.completed (mirroring the one sent empty on response.created).
+                      // Clients (e.g. langchainjs-openai) read `response.output` here to build
+                      // the final aggregated message/tool-call - omitting it causes them to
+                      // crash doing `response.output.map(...)` on undefined.
+                      output: completedOutput,
                       usage: {
                         input_tokens: streamResult.tokens.input,
                         output_tokens: streamResult.tokens.output,
@@ -3030,7 +3045,13 @@ data: ${JSON.stringify(data)}
                 sseEvent("response.output_item.done", {
                   type: "response.output_item.done",
                   output_index: 0,
-                  item: { id: itemID, type: "message", status: "completed", role: "assistant" }
+                  item: {
+                    id: itemID,
+                    type: "message",
+                    status: "completed",
+                    role: "assistant",
+                    content: [{ type: "output_text", text: accumulatedText, annotations: [] }]
+                  }
                 })
               );
               queue.enqueue(
@@ -3042,6 +3063,16 @@ data: ${JSON.stringify(data)}
                     created_at: now,
                     status: "completed",
                     model: model.id,
+                    // See the tool-call branch above for why `output` must be present here.
+                    output: [
+                      {
+                        id: itemID,
+                        type: "message",
+                        status: "completed",
+                        role: "assistant",
+                        content: [{ type: "output_text", text: accumulatedText, annotations: [] }]
+                      }
+                    ],
                     usage: {
                       input_tokens: streamResult.tokens.input,
                       output_tokens: streamResult.tokens.output,
@@ -3444,12 +3475,17 @@ var OpenAIProxyPlugin = async ({ client }) => {
     });
     return {};
   }
+  const idleTimeout = Math.min(
+    255,
+    Math.max(10, Number.parseInt(process.env.OPENCODE_LLM_PROXY_IDLE_TIMEOUT ?? "255", 10) || 255)
+  );
   let server;
   try {
     state.pluginEvents = /* @__PURE__ */ new Set();
     server = Bun.serve({
       hostname,
       port,
+      idleTimeout,
       fetch: createProxyFetchHandler(client, (sessionID, signal) => createPluginEventStream(state.pluginEvents, sessionID, signal))
     });
   } catch (error) {
@@ -3465,6 +3501,7 @@ var OpenAIProxyPlugin = async ({ client }) => {
   await safeLog(client, "info", "OpenAI proxy server started", {
     hostname,
     port,
+    idleTimeout,
     protected: Boolean(process.env.OPENCODE_LLM_PROXY_TOKEN)
   });
   return {
