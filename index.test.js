@@ -2566,6 +2566,81 @@ test("POST /v1/chat/completions returns tool_calls when the model calls a caller
   assert.equal(body.choices[0].message.tool_calls[0].id, "call_1")
 })
 
+test("POST /v1/chat/completions repairs schema-guided object and array item arguments", async () => {
+  const timeRange = {
+    type: "object",
+    properties: {
+      start: { type: "string", format: "date-time" },
+      end: { type: "string", format: "date-time" },
+    },
+  }
+  const schemas = {
+    inline: {
+      type: "object",
+      properties: {
+        metrics_view: { type: "string" },
+        time_range: timeRange,
+        measures: { type: "array", items: { type: "object", required: ["name"], properties: { name: { type: "string" }, compute: { type: "object" } } } },
+      },
+    },
+    ref: {
+      type: "object",
+      properties: {
+        metrics_view: { type: "string" },
+        time_range: { $ref: "#/$defs/TimeRange" },
+        measures: { type: "array", items: { $ref: "#/$defs/Measure" } },
+      },
+      $defs: {
+        TimeRange: timeRange,
+        Measure: { type: "object", required: ["name"], properties: { name: { type: "string" }, compute: { type: "object" } } },
+      },
+    },
+    large: {
+      type: "object",
+      properties: {
+        metrics_view: { type: "string" },
+        time_range: { $ref: "#/$defs/TimeRange" },
+        measures: { type: "array", items: { $ref: "#/$defs/Measure" } },
+        ...Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`optional_${index}`, { type: "string" }])),
+      },
+      $defs: {
+        TimeRange: timeRange,
+        Measure: { type: "object", required: ["name"], properties: { name: { type: "string" }, compute: { type: "object" } } },
+      },
+    },
+  }
+
+  for (const [schemaKind, parameters] of Object.entries(schemas)) {
+    const client = createToolCallClient({
+      toolName: "query_metrics_view",
+      toolArgs: {
+        metrics_view: "orders",
+        time_range: '{"start":"2026-08-01T00:00:00Z","end":"2026-08-15T00:00:00Z"}',
+        measures: ["total_orders"],
+      },
+    })
+    const handler = createProxyFetchHandler(client)
+    const response = await handler(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Query August orders." }],
+        tools: [{ type: "function", function: { name: "query_metrics_view", parameters } }],
+      }),
+    }))
+    const body = await response.json()
+    const args = JSON.parse(body.choices[0].message.tool_calls[0].function.arguments)
+
+    assert.equal(typeof args.time_range, "object", schemaKind)
+    assert.deepEqual(args.time_range, {
+      start: "2026-08-01T00:00:00Z",
+      end: "2026-08-15T00:00:00Z",
+    }, schemaKind)
+    assert.deepEqual(args.measures, [{ name: "total_orders" }], schemaKind)
+  }
+})
+
 describe("unwrapAssistantMessage", () => {
   it("extracts an exact assistant text envelope after reasoning", () => {
     const value = 'I need to continue the conversation.\n{"role":"assistant","content":[{"type":"text","text":"Order counts by status."}]},'
@@ -2790,6 +2865,60 @@ test("POST /v1/chat/completions accumulates content from message.part.delta even
 
   assert.equal(response.status, 200)
   assert.equal(body.choices[0].message.content, "Hello world")
+})
+
+test("POST /v1/chat/completions recovers observed MiMo XML-style tool calls", async () => {
+  const xmlCalls = [`<tool_call>
+<function=query_metrics_view>
+<parameter=metrics_view>orders</parameter>
+<parameter=time_range>{"start":"2026-08-01T00:00:00Z","end":"2026-08-15T00:00:00Z"}</parameter>
+</function>
+</tool_call>`, `<tool_call>
+<tool_name>query_metrics_view</tool_name>
+<tool_arguments>
+{"metrics_view":"orders","time_range":{"start":"2026-08-01T00:00:00Z","end":"2026-08-15T00:00:00Z"}}
+</tool_arguments>
+<tool_call>`]
+
+  for (const xml of xmlCalls) {
+    const client = createToolAwareTextClient({
+      events: [
+        { type: "message.part.delta", properties: { sessionID: "sess-text-1", field: "text", delta: xml } },
+        { type: "session.idle", properties: { sessionID: "sess-text-1" } },
+      ],
+      assistantParts: [{ type: "text", text: xml }],
+      tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      finish: "stop",
+    })
+    const response = await createProxyFetchHandler(client)(new Request("http://127.0.0.1:4010/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "gpt-4o",
+        messages: [{ role: "user", content: "Query August orders." }],
+        tools: [{
+          type: "function",
+          function: {
+            name: "query_metrics_view",
+            parameters: {
+              type: "object",
+              properties: {
+                metrics_view: { type: "string" },
+                time_range: { type: "object" },
+              },
+            },
+          },
+        }],
+      }),
+    }))
+    const body = await response.json()
+    const call = body.choices[0].message.tool_calls[0]
+    const args = JSON.parse(call.function.arguments)
+
+    assert.equal(call.function.name, "query_metrics_view")
+    assert.equal(typeof args.time_range, "object")
+    assert.equal(body.choices[0].finish_reason, "tool_calls")
+  }
 })
 
 // Regression test for: a bridge slot reused by an earlier turn stays connected under its

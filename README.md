@@ -38,6 +38,7 @@ Your tool (OpenAI / Anthropic / Gemini SDK, coding agent, etc.)
 |---|---|---:|---:|---|
 | n8n AI Agent | OpenAI / Anthropic | yes | yes | Use native Chat Model credentials pointed at the proxy. See [recipe](docs/recipes/n8n.md) |
 | Open WebUI | OpenAI-compatible | yes | partial | Depends on Open WebUI feature support. See [recipe](docs/recipes/open-webui.md) |
+| DB-GPT | OpenAI-compatible | yes | yes | Configure a `proxy/openai` model. See [recipe](docs/recipes/db-gpt.md) |
 | LangChain | OpenAI / Anthropic | yes | yes | Works with normal SDK wrappers. See [recipe](docs/recipes/langchain.md) |
 | OpenAI SDK | Chat Completions / Responses | yes | yes | Use `baseURL` / `base_url` |
 | Anthropic SDK | Messages API | yes | yes | Use proxy base URL |
@@ -73,6 +74,7 @@ See also: [Security](docs/security.md) · [Comparisons](docs/comparisons.md) · 
 - [Configuration](#configuration)
 - [Tool calling](#tool-calling)
 - [Using with SDKs and tools](#using-with-sdks-and-tools)
+  - [DB-GPT](docs/recipes/db-gpt.md)
   - [n8n](#n8n)
 - [Recipes](docs/recipes/)
 - [Security](docs/security.md)

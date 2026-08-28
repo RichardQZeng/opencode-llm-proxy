@@ -1895,6 +1895,104 @@ function normalizeParameters(parameters) {
   if (parameters && typeof parameters === "object") return parameters;
   return { type: "object", properties: {} };
 }
+function resolveLocalSchema(schema, root, seen = /* @__PURE__ */ new Set()) {
+  while (isPlainObject(schema) && typeof schema.$ref === "string" && schema.$ref.startsWith("#/") && !seen.has(schema.$ref)) {
+    seen.add(schema.$ref);
+    schema = schema.$ref.slice(2).split("/").reduce(
+      (value, part) => value?.[part.replace(/~1/g, "/").replace(/~0/g, "~")],
+      root
+    );
+  }
+  return isPlainObject(schema) ? schema : null;
+}
+function requiredContainerType(schema, root) {
+  const resolved = resolveLocalSchema(schema, root);
+  if (!resolved) return null;
+  const types = Array.isArray(resolved.type) ? resolved.type : [resolved.type];
+  for (const type of ["object", "array"]) {
+    if (types.includes(type) && types.every((entry) => entry === type || entry === "null")) return type;
+  }
+  return null;
+}
+function repairToolArguments(schema, value, root = schema) {
+  const resolved = resolveLocalSchema(schema, root);
+  if (!resolved) return { value, changed: false };
+  let changed = false;
+  const expected = requiredContainerType(resolved, root);
+  if (typeof value === "string" && expected) {
+    try {
+      const parsed = JSON.parse(value);
+      if (expected === "object" && isPlainObject(parsed) || expected === "array" && Array.isArray(parsed)) {
+        value = parsed;
+        changed = true;
+      }
+    } catch {
+      const required = resolved.required;
+      if (expected === "object" && Array.isArray(required) && required.length === 1 && isPlainObject(resolved.properties?.[required[0]]) && !value.trimStart().startsWith("{") && !value.trimStart().startsWith("[")) {
+        value = { [required[0]]: value };
+        changed = true;
+      }
+    }
+  }
+  if (isPlainObject(value)) {
+    for (const [key, item] of Object.entries(value)) {
+      const propertySchema = resolved.properties?.[key] ?? resolved.additionalProperties;
+      if (!isPlainObject(propertySchema)) continue;
+      const result = repairToolArguments(propertySchema, item, root);
+      if (result.changed) {
+        value[key] = result.value;
+        changed = true;
+      }
+    }
+  } else if (Array.isArray(value) && isPlainObject(resolved.items)) {
+    value.forEach((item, index) => {
+      const result = repairToolArguments(resolved.items, item, root);
+      if (result.changed) {
+        value[index] = result.value;
+        changed = true;
+      }
+    });
+  }
+  return { value, changed };
+}
+function parseXmlToolCalls(content, tools) {
+  if (typeof content !== "string" || !content.includes("<tool_call>")) return [];
+  const declared = new Map(tools.map((tool) => [tool.name, tool]));
+  const calls = [];
+  const addCall = (name, args) => {
+    const tool = declared.get(name);
+    if (!tool || !isPlainObject(args)) return;
+    calls.push({
+      id: `call_${crypto.randomUUID().replace(/-/g, "")}`,
+      name,
+      arguments: repairToolArguments(tool.parameters, args).value
+    });
+  };
+  const callPattern = /<tool_call>\s*<function=([^>]+)>([\s\S]*?)<\/function>\s*<\/tool_call>/g;
+  for (const match of content.matchAll(callPattern)) {
+    const name = match[1].trim();
+    const args = {};
+    const parameterPattern = /<parameter=([^>]+)>([\s\S]*?)<\/parameter>/g;
+    for (const parameter of match[2].matchAll(parameterPattern)) {
+      const key = parameter[1].trim();
+      const raw = parameter[2].trim();
+      try {
+        args[key] = JSON.parse(raw);
+      } catch {
+        args[key] = raw;
+      }
+    }
+    addCall(name, args);
+  }
+  const namedPattern = /<tool_call>\s*<tool_name>([^<]+)<\/tool_name>\s*<tool_arguments>([\s\S]*?)<\/tool_arguments>\s*(?:<\/tool_call>|<tool_call>)/g;
+  for (const match of content.matchAll(namedPattern)) {
+    try {
+      addCall(match[1].trim(), JSON.parse(match[2]));
+    } catch {
+    }
+  }
+  return calls;
+}
 function parseOpenAITools(body) {
   const list = [];
   if (Array.isArray(body?.tools)) {
@@ -1986,9 +2084,12 @@ async function registerToolBridge(client, tools, options = {}) {
   try {
     const seen = /* @__PURE__ */ new Set();
     const nameMap = /* @__PURE__ */ new Map();
+    const schemaMap = /* @__PURE__ */ new Map();
     const bridgeTools = tools.map((tool) => {
       const sanitized = sanitizeToolName(tool.name, seen);
-      nameMap.set(`${slotName}_${sanitized}`, tool.name);
+      const toolID = `${slotName}_${sanitized}`;
+      nameMap.set(toolID, tool.name);
+      schemaMap.set(toolID, tool.parameters);
       return { name: sanitized, description: tool.description, parameters: tool.parameters };
     });
     try {
@@ -2011,7 +2112,7 @@ async function registerToolBridge(client, tools, options = {}) {
     const toolIDs = bridgeTools.map((tool) => `${slotName}_${tool.name}`);
     const bridgeState = getToolBridgeState();
     bridgeState.slotToolIDs.set(slotName, toolIDs);
-    return { slotName, toolIDs, nameMap };
+    return { slotName, toolIDs, nameMap, schemaMap };
   } catch (error) {
     releaseBridgeSlot(slotName);
     throw error;
@@ -2058,7 +2159,9 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   const recordToolPart = (part) => {
     const callID = part.callID;
     if (!callID) return;
-    const input = part.state?.input;
+    const rawInput = part.state?.input;
+    const normalized = isPlainObject(rawInput) ? repairToolArguments(bridge.schemaMap.get(part.tool), rawInput) : { value: rawInput, changed: false };
+    const input = normalized.value;
     const hasInput = input && typeof input === "object" && !Array.isArray(input) && Object.keys(input).length > 0;
     const existing = toolCallsByID.get(callID);
     if (!existing) {
@@ -2066,11 +2169,13 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
         id: callID,
         name: bridge.nameMap.get(part.tool) ?? part.tool,
         arguments: hasInput ? input : {},
-        hasInput: Boolean(hasInput)
+        hasInput: Boolean(hasInput),
+        repaired: normalized.changed
       });
     } else if (hasInput && !existing.hasInput) {
       existing.arguments = input;
       existing.hasInput = true;
+      existing.repaired = normalized.changed;
     }
   };
   try {
@@ -2151,11 +2256,15 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
     clearGenerationControls(sessionID);
     releaseToolBridge(bridge);
   }
-  const toolCalls = [...toolCallsByID.values()].map((call) => ({
+  let toolCalls = [...toolCallsByID.values()].map((call) => ({
     id: call.id,
     name: call.name,
     arguments: call.arguments ?? {}
   }));
+  const repairedTools = [...toolCallsByID.values()].filter((call) => call.repaired).map((call) => call.name);
+  if (repairedTools.length > 0) {
+    await safeLog(client, "warn", "Repaired tool arguments from declared schemas", { tools: repairedTools });
+  }
   if (errorMessage && toolCalls.length === 0) {
     await deleteSession(client, sessionID, options.keepSessions);
     throw new Error(errorMessage);
@@ -2175,6 +2284,13 @@ async function runAgentTurn(client, model, messages, system, callerTools, onChun
   if (!content && assistantInfo?.structured !== void 0) content = JSON.stringify(assistantInfo.structured);
   if (toolCalls.length === 0 && assistantInfo?.structured === void 0 && options.unwrapAssistantEnvelope) {
     content = unwrapAssistantMessage(content);
+  }
+  if (toolCalls.length === 0) {
+    toolCalls = parseXmlToolCalls(content, callerTools);
+    if (toolCalls.length > 0) {
+      content = "";
+      await safeLog(client, "warn", "Recovered XML-style tool calls from assistant text", { tools: toolCalls.map((call) => call.name) });
+    }
   }
   const result = {
     sessionID,
