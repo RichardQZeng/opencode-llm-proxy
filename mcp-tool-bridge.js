@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import { Buffer } from "node:buffer"
+import { resolve } from "node:path"
+import { fileURLToPath } from "node:url"
 
 // Minimal MCP (Model Context Protocol) stdio server used internally by opencode-llm-proxy
 // to expose a proxy caller's OpenAI/Anthropic/Gemini tool schemas to OpenCode as if they
@@ -167,7 +169,7 @@ export function runStdioServer(tools, options = {}) {
 
 // Only start the stdio server when executed directly (`node mcp-tool-bridge.js`),
 // not when imported by tests.
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
   const tools = parseTools(process.env.OPENCODE_LLM_PROXY_BRIDGE_TOOLS, (err) =>
     process.stderr.write(`opencode-llm-proxy bridge: failed to parse tool schemas: ${err}\n`),
   )
